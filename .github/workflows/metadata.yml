@@ -1,0 +1,66 @@
+---
+name: Update metadata.json
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: add-missing (PR label enhancement), remove-eol (PR label breaking changes) or none (only metadata_deps)
+        required: true
+        type: choice
+        options:
+          - add-missing
+          - remove-eol
+          - none
+      metadata_deps:
+        description: Run rake metadata_deps afterwards
+        required: false
+        type: boolean
+        default: false
+      filter:
+        description: Only process modules matching this regex, e.g. ^puppet-rundeck$ (empty = all managed modules)
+        required: false
+        type: string
+      noop:
+        description: Only show what would change
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    name: metadata ${{ inputs.mode }}
+    env:
+      # Token with contents + pull requests write access on the module repositories.
+      # The default GITHUB_TOKEN only has access to this repository.
+      GITHUB_TOKEN: ${{ secrets.OS_VERSIONS_TOKEN }}
+      GH_TOKEN: ${{ secrets.OS_VERSIONS_TOKEN }}
+      MODE: ${{ inputs.mode }}
+      METADATA_DEPS: ${{ inputs.metadata_deps }}
+      FILTER: ${{ inputs.filter }}
+      NOOP: ${{ inputs.noop }}
+      NAMESPACE: ${{ github.repository_owner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup ruby
+        uses: ruby/setup-ruby@651ff0d62c5c79bed6d53ec518387aae20e72c1a # v1.329.0
+        with:
+          ruby-version: ruby
+          bundler-cache: true
+      - name: Configure git
+        run: |
+          gh auth setup-git
+          git config --global user.name "Joris29"
+          git config --global user.email "joris.vanacoleyen@bryxx.eu"
+      - name: Run bin/metadata
+        run: |
+          args=(--namespace "$NAMESPACE" --git-base https://github.com/)
+          [ "$MODE" != none ] && args=("$MODE" "${args[@]}")
+          [ "$METADATA_DEPS" = true ] && args+=(--metadata-deps)
+          [ -n "$FILTER" ] && args+=(--filter "$FILTER")
+          [ "$NOOP" = true ] && args+=(--noop)
+          bundle exec bin/metadata "${args[@]}"

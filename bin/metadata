@@ -1,0 +1,134 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Maintain the metadata.json of the managed modules.
+#
+#   add-missing / remove-eol
+#     Run `puppet-metadata os-versions --add-missing|--remove-eol` and open a pull
+#     request for every module whose metadata.json changed.
+#   --metadata-deps
+#     Run `rake metadata_deps` on the cloned modules afterwards (report only).
+#
+# It reuses modulesync's own classes, so cloning, branching, committing, pushing
+# and opening the PR behave exactly like `msync update --pr`, and the usual msync
+# options (filter, namespace, git base, signing) work the same way.
+#
+# Usage:
+#   bundle exec bin/metadata add-missing
+#   bundle exec bin/metadata remove-eol -f '^puppet-rundeck$' --metadata-deps
+#   bundle exec bin/metadata --metadata-deps
+#
+# Opening PRs requires GITHUB_TOKEN (like `msync update --pr`) unless --noop or --no-pr is used.
+
+require 'open3'
+require 'optparse'
+require 'modulesync'
+
+MODES = {
+  'add-missing' => {
+    title: 'Add support for new operating system releases',
+    labels: 'enhancement',
+  },
+  'remove-eol' => {
+    title: 'Drop support for EOL operating system releases',
+    labels: 'breaking changes',
+  },
+}.freeze
+
+cli = { pr: true, verbose: true, rebase: true }
+metadata_deps = false
+
+parser = OptionParser.new do |opts|
+  opts.banner = "Usage: #{$PROGRAM_NAME} [#{MODES.keys.join('|')}] [options]"
+
+  opts.on('--metadata-deps', 'Run `rake metadata_deps` on the modules afterwards') { metadata_deps = true }
+  opts.on('-f', '--filter REGEX', 'Only process modules matching this regex (like msync -f)') { |v| cli[:filter] = v }
+  opts.on('-x', '--negative-filter REGEX', 'Skip modules matching this regex (like msync -x)') { |v| cli[:negative_filter] = v }
+  opts.on('-n', '--namespace NAMESPACE', 'GitHub namespace of the modules') { |v| cli[:namespace] = v }
+  opts.on('--git-base URL', 'Git base URL, e.g. https://github.com/') { |v| cli[:git_base] = v }
+  opts.on('-b', '--branch BRANCH', 'Branch to push the changes to (default: os-versions/<mode>)') { |v| cli[:branch] = v }
+  opts.on('--pr-labels LABELS', 'Comma separated PR labels (default depends on the mode)') { |v| cli[:pr_labels] = v }
+  opts.on('--pr-target-branch BRANCH', 'Target branch of the PR (default: repository default branch)') { |v| cli[:pr_target_branch] = v }
+  opts.on('--[no-]pr', 'Open a pull request (default: true)') { |v| cli[:pr] = v }
+  opts.on('--noop', 'Only show what would change, do not commit, push or open PRs') { cli[:noop] = true }
+  opts.on('--sign', 'GPG/SSH sign the commits') { cli[:sign] = true }
+  opts.on('--signoff', 'Add a Signed-off-by line to the commits') { cli[:signoff] = true }
+end
+parser.parse!
+
+mode = ARGV.shift
+abort(parser.help) if mode && !MODES.key?(mode)
+abort(parser.help) unless mode || metadata_deps
+
+if mode
+  cli[:branch] ||= "os-versions/#{mode}"
+  cli[:pr_title] = MODES[mode][:title]
+  cli[:pr_labels] ||= MODES[mode][:labels]
+else
+  # Only checking: stay on each repository's default branch
+  cli[:branch] = nil
+  cli[:pr] = false
+end
+
+# Same option handling as the msync CLI: modulesync.yml defaults < command line options.
+# ModuleSync keeps its options in module state, which is what PuppetModule reads from.
+options = ModuleSync.config_defaults.merge(ModuleSync::CLI.prepare_options(cli))
+ModuleSync.instance_variable_set(:@options, options)
+
+modules = ModuleSync.managed_modules
+abort 'No modules matched the filter' if modules.empty?
+
+# Like `msync update --pr`: validate PR credentials before touching any repository
+modules.each(&:git_service) if options[:pr] && !options[:noop]
+
+failed = []
+
+modules.each do |puppet_module|
+  puts "== #{puppet_module.given_name}"
+  repository = puppet_module.repository
+
+  repository.prepare_workspace(branch: options[:branch], operate_offline: false, rebase: options[:rebase])
+  next unless mode
+
+  metadata = puppet_module.path('metadata.json')
+  unless File.exist?(metadata)
+    puts 'No metadata.json, skipping'
+    next
+  end
+
+  command = ['bundle', 'exec', 'puppet-metadata', '--filename', metadata, 'os-versions', "--#{mode}"]
+  command << '--noop' if options[:noop]
+  output, status = Open3.capture2e(*command)
+  puts output
+  raise ModuleSync::Error, "puppet-metadata failed (#{status})" unless status.success?
+
+  next if options[:noop]
+
+  # Commit message and PR description
+  options[:message] = <<~MESSAGE.strip
+    #{options[:pr_title]}
+
+    Generated with `puppet-metadata os-versions --#{mode}`:
+
+    #{output.strip}
+  MESSAGE
+
+  pushed = repository.submit_changes(['metadata.json'], options)
+  # A branch from a previous run may still need a PR even without new changes
+  if options[:pr] && (pushed || puppet_module.pull_request_branch_ready?)
+    puppet_module.open_pull_request
+  elsif !pushed
+    puts 'No changes'
+  end
+rescue StandardError => e
+  warn "#{puppet_module.given_name}: #{e.message}"
+  puts "::error::#{puppet_module.given_name}: #{e.message}" if ENV['GITHUB_ACTIONS']
+  failed << puppet_module.given_name
+end
+
+if metadata_deps
+  puts '== rake metadata_deps'
+  failed << 'rake metadata_deps' unless system('bundle', 'exec', 'rake', 'metadata_deps')
+end
+
+abort "Failed: #{failed.join(', ')}" unless failed.empty?
